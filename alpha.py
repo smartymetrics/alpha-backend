@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-alpha.py - Solana Early Trader PNL Analysis (corrected, optimized, Supabase upload)
+alpha.py - Solana Early Trader PNL Analysis (with API-key rotation + failover,
+           corrected, optimized, Supabase upload)
 
 Usage:
     python alpha.py <token_mint1> [token_mint2 token_mint3]
@@ -8,8 +9,12 @@ Usage:
 
 Notes:
  - Up to 3 tokens allowed.
- - Requires MORALIS_API_KEY, HELIUS_API_KEY, SUPABASE_URL, SUPABASE_KEY in env or .env
+ - Supports multiple provider keys via environment variables:
+     MORALIS_KEYS (comma-separated) or MORALIS_API_KEY (legacy single; also accepts comma-separated)
+     HELIUS_KEYS  (comma-separated) or HELIUS_API_KEY  (legacy single; also accepts comma-separated)
+ - Requires SUPABASE_URL, SUPABASE_KEY to upload/list analyses.
  - Caches Dexscreener current prices in sol_price_cache.pkl using joblib.
+ - If a request returns 401 or 429 the code will rotate to the next key and retry.
 """
 
 import os
@@ -23,6 +28,7 @@ import asyncio
 import aiohttp
 import json
 import logging
+import math
 from datetime import timedelta, datetime, timezone
 from typing import List, Optional, Dict, Any
 from dotenv import load_dotenv
@@ -34,14 +40,36 @@ load_dotenv()
 # Config & Keys
 # --------------------
 CACHE_FILE = "sol_price_cache.pkl"
-MORALIS_API_KEY = os.environ.get("MORALIS_API_KEY")
-HELIUS_API_KEY = os.environ.get("HELIUS_API_KEY")
+
+# Support both single-key env var and comma-separated multi-key env var.
+# Also handle the case where the user accidentally placed comma-separated keys in the single var.
+def _load_keys(env_name_single: str, env_name_multi: str) -> List[str]:
+    """
+    Attempt to load keys from env_name_multi first (preferred). If not present,
+    fall back to env_name_single. If either contains commas, split them.
+    Returns a list of stripped keys (no empty entries).
+    """
+    multi = os.environ.get(env_name_multi)
+    single = os.environ.get(env_name_single)
+
+    keys: List[str] = []
+    if multi:
+        keys = [k.strip() for k in multi.split(",") if k.strip()]
+    elif single:
+        # allow the single variable to contain a comma-separated list as well
+        if "," in single:
+            keys = [k.strip() for k in single.split(",") if k.strip()]
+        else:
+            keys = [single.strip()]
+    return keys
+
+MORALIS_KEYS = _load_keys("MORALIS_API_KEY", "MORALIS_KEYS")
+HELIUS_KEYS = _load_keys("HELIUS_API_KEY", "HELIUS_KEYS")
+
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 # set your bucket name here
 BUCKET_NAME = os.getenv("SUPABASE_BUCKET", "monitor-data")
-
-HELIUS_RPC_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 
 DEFAULT_EARLY_WINDOW_HOURS = 6
 DEFAULT_MINIMUM_INITIAL_BUY_USD = 100.0
@@ -49,7 +77,7 @@ DEFAULT_MIN_PROFITABLE_TRADES = 1
 
 # Base tokens (used to identify buys)
 BASE_TOKENS = {
-    "So11111111111111111111111111111111111111112",  # SOL
+    "So11111111111111111111111111111111111111112",  # SOL (example)
     "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"   # USDC
 }
@@ -66,6 +94,10 @@ logger = logging.getLogger("alpha")
 # threshold (seconds) to warn for long RPC/API calls
 LONG_CALL_THRESHOLD = float(os.environ.get("LONG_CALL_THRESHOLD", 2.0))
 
+# simple counters for round-robin rotation
+_moralis_idx = 0
+_helius_idx = 0
+
 # --------------------
 # Helpers
 # --------------------
@@ -76,13 +108,22 @@ def _safe_float(v):
         return None
 
 def ensure_keys_present(require_supabase: bool = False):
-    if not MORALIS_API_KEY:
-        raise RuntimeError("MORALIS_API_KEY not set in environment")
-    if not HELIUS_API_KEY:
-        raise RuntimeError("HELIUS_API_KEY not set in environment")
+    if not MORALIS_KEYS:
+        raise RuntimeError("MORALIS_API_KEY / MORALIS_KEYS not set in environment (no Moralis keys found)")
+    if not HELIUS_KEYS:
+        raise RuntimeError("HELIUS_API_KEY / HELIUS_KEYS not set in environment (no Helius keys found)")
     if require_supabase:
         if not SUPABASE_URL or not SUPABASE_KEY:
             raise RuntimeError("SUPABASE_URL or SUPABASE_KEY not set in environment")
+
+def _mask_key(s: str, keep: int = 6) -> str:
+    """Return a masked version of a key (show last `keep` chars)."""
+    if not s:
+        return "None"
+    s = str(s)
+    if len(s) <= keep:
+        return s
+    return "..." + s[-keep:]
 
 # --------------------
 # Supabase helpers
@@ -92,14 +133,9 @@ def get_supabase_client() -> Client:
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def _supabase_path(folder: str, filename: str) -> str:
-    # uses a prefix "folder/filename" to emulate folders in Supabase storage
     return f"{folder.rstrip('/')}/{filename}"
 
 def save_to_supabase(df: pd.DataFrame, tokens: List[str], params: Dict[str, Any]):
-    """
-    Save DataFrame to local recent_analyses folder and upload both .pkl and .json to Supabase.
-    For free plan (no upsert) we remove the object first if exists and then upload.
-    """
     ensure_keys_present(require_supabase=True)
     supabase = get_supabase_client()
 
@@ -111,9 +147,7 @@ def save_to_supabase(df: pd.DataFrame, tokens: List[str], params: Dict[str, Any]
     pkl_file_local = os.path.join(folder, f"{base_name}.pkl")
     json_file_local = os.path.join(folder, f"{base_name}.json")
 
-    # Save local .pkl
     joblib.dump(df, pkl_file_local)
-    # Save JSON cleaned: records + metadata
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "tokens": tokens,
@@ -125,27 +159,19 @@ def save_to_supabase(df: pd.DataFrame, tokens: List[str], params: Dict[str, Any]
 
     logger.info("Saved analysis locally: %s and %s", pkl_file_local, json_file_local)
 
-    # Upload to Supabase under prefix folder/
     for local_path in [pkl_file_local, json_file_local]:
         filename = os.path.basename(local_path)
         object_path = _supabase_path(folder, filename)
         try:
-            # remove if exists (free plan)
             supabase.storage.from_(BUCKET_NAME).remove([object_path])
         except Exception:
-            # ignore if not existing
             pass
         with open(local_path, "rb") as fh:
             data_bytes = fh.read()
-            # upload
             supabase.storage.from_(BUCKET_NAME).upload(object_path, data_bytes)
         logger.info("Uploaded to Supabase: %s", object_path)
 
 def list_recent_analyses(limit: int = 100, folder: str = "recent_analyses") -> List[Dict[str, Any]]:
-    """
-    Return list of recent analyses metadata from Supabase storage folder.
-    Each item includes name, last_modified, size, and a public URL (if available).
-    """
     ensure_keys_present(require_supabase=True)
     supabase = get_supabase_client()
 
@@ -158,7 +184,6 @@ def list_recent_analyses(limit: int = 100, folder: str = "recent_analyses") -> L
     results = []
     for it in items:
         name = it.get("name")
-        # Build public URL (works if bucket is public)
         object_path = _supabase_path(folder, name)
         try:
             public_url = supabase.storage.from_(BUCKET_NAME).get_public_url(object_path).get("publicURL")
@@ -174,6 +199,107 @@ def list_recent_analyses(limit: int = 100, folder: str = "recent_analyses") -> L
     return results
 
 # --------------------
+# Request failover helpers
+# --------------------
+def _next_moralis_key() -> str:
+    global _moralis_idx
+    if not MORALIS_KEYS:
+        raise RuntimeError("No Moralis keys available")
+    key = MORALIS_KEYS[_moralis_idx % len(MORALIS_KEYS)]
+    idx_used = _moralis_idx
+    _moralis_idx += 1
+    logger.debug("[moralis] using key index=%d masked=%s", idx_used, _mask_key(key))
+    return key
+
+def _next_helius_key() -> str:
+    global _helius_idx
+    if not HELIUS_KEYS:
+        raise RuntimeError("No Helius keys available")
+    key = HELIUS_KEYS[_helius_idx % len(HELIUS_KEYS)]
+    idx_used = _helius_idx
+    _helius_idx += 1
+    logger.debug("[helius] using key index=%d masked=%s", idx_used, _mask_key(key))
+    return key
+
+def requests_with_failover(url: str, method: str = "GET", params: dict = None, headers: dict = None,
+                           json_payload: dict = None, max_attempts: int = 6, provider: str = "moralis", timeout: int = 20):
+    """
+    Synchronous requests wrapper that rotates keys on 401/429 responses or connection errors.
+    - provider: "moralis" supported for sync usage
+    """
+    attempt = 0
+    last_exception = None
+    # ensure we try at most max_attempts but also allow more tries proportional to key count
+    max_attempts = max_attempts or max(6, len(MORALIS_KEYS) * 2 if MORALIS_KEYS else 6)
+
+    while attempt < max_attempts:
+        attempt += 1
+        try:
+            if provider == "moralis":
+                key = _next_moralis_key()
+                use_headers = dict(headers or {})
+                # Moralis expects X-API-Key header
+                use_headers["Accept"] = "application/json"
+                use_headers["X-API-Key"] = key
+                resp = requests.request(method, url, params=params, headers=use_headers, json=json_payload, timeout=timeout)
+            else:
+                # fallback generic
+                use_headers = dict(headers or {})
+                resp = requests.request(method, url, params=params, headers=use_headers, json=json_payload, timeout=timeout)
+
+            if resp.status_code in (401, 429):
+                logger.warning("[%s] request returned %s (attempt %d). Rotating key and retrying...", provider, resp.status_code, attempt)
+                time.sleep(min(1 + attempt * 0.5, 5.0))
+                continue
+
+            resp.raise_for_status()
+            try:
+                return resp.json()
+            except Exception:
+                return {"_raw_text": resp.text}
+        except requests.RequestException as e:
+            last_exception = e
+            logger.warning("[%s] request exception (attempt %d): %s", provider, attempt, e)
+            time.sleep(min(0.5 * attempt, 5.0))
+            continue
+
+    raise RuntimeError(f"All attempts failed for {provider}. Last exception: {last_exception}")
+
+async def aiohttp_with_failover_post(payload: dict, max_attempts: int = 6, timeout: int = 30) -> dict:
+    """
+    Async wrapper to POST to Helius RPC, rotating through HELIUS_KEYS on 429/401 & retrying.
+    Returns parsed json.
+    """
+    attempt = 0
+    last_exc = None
+    max_attempts = max_attempts or max(6, len(HELIUS_KEYS) * 2 if HELIUS_KEYS else 6)
+
+    while attempt < max_attempts:
+        attempt += 1
+        key = _next_helius_key()
+        helius_url = f"https://mainnet.helius-rpc.com/?api-key={key}"
+        try:
+            start = time.time()
+            async with aiohttp.ClientSession() as session:
+                async with session.post(helius_url, json=payload, timeout=timeout) as resp:
+                    elapsed = time.time() - start
+                    if elapsed > LONG_CALL_THRESHOLD:
+                        logger.warning("Long Helius RPC call method=%s elapsed=%.2fs", payload.get("method"), elapsed)
+                    if resp.status in (401, 429):
+                        logger.warning("[helius] returned %s on attempt %d, rotating key...", resp.status, attempt)
+                        await asyncio.sleep(min(0.5 * attempt, 5.0))
+                        continue
+                    resp.raise_for_status()
+                    return await resp.json()
+        except Exception as e:
+            last_exc = e
+            logger.warning("[helius] exception on attempt %d: %s", attempt, e)
+            await asyncio.sleep(min(0.5 * attempt, 5.0))
+            continue
+
+    raise RuntimeError(f"All helius attempts failed. Last exception: {last_exc}")
+
+# --------------------
 # Moralis trades downloader (with timing logs)
 # --------------------
 def _timed_get(url, **kwargs):
@@ -185,10 +311,6 @@ def _timed_get(url, **kwargs):
     return resp
 
 def get_solana_dex_trades(token_addresses: List[str], limit: int = 100) -> pd.DataFrame:
-    """
-    Fetch swaps for token addresses from Moralis (cursor pagination).
-    Returns a dataframe with important fields and derived_price fallback.
-    """
     if not isinstance(token_addresses, list):
         raise TypeError("token_addresses must be a list")
     if len(token_addresses) == 0:
@@ -197,7 +319,6 @@ def get_solana_dex_trades(token_addresses: List[str], limit: int = 100) -> pd.Da
         raise ValueError("A maximum of 3 tokens is allowed per request.")
     ensure_keys_present()
 
-    headers = {"Accept": "application/json", "X-API-Key": MORALIS_API_KEY}
     all_rows = []
 
     for addr in token_addresses:
@@ -209,14 +330,20 @@ def get_solana_dex_trades(token_addresses: List[str], limit: int = 100) -> pd.Da
             if cursor:
                 params["cursor"] = cursor
             try:
-                resp = _timed_get(url, headers=headers, params=params, timeout=20)
-                resp.raise_for_status()
-                data = resp.json()
+                data = requests_with_failover(url, method="GET", params=params, provider="moralis",
+                                              max_attempts=max(6, len(MORALIS_KEYS) * 2 if MORALIS_KEYS else 6))
             except Exception as e:
                 logger.error("[Moralis] request error for %s: %s", addr, e)
                 break
 
-            trades = data.get("result", []) or []
+            trades = []
+            if isinstance(data, dict):
+                trades = data.get("result", []) or data.get("result", {}).get("data", []) or data.get("result", []) or []
+            elif isinstance(data, list):
+                trades = data
+            else:
+                trades = []
+
             if not trades:
                 break
 
@@ -237,24 +364,29 @@ def get_solana_dex_trades(token_addresses: List[str], limit: int = 100) -> pd.Da
 
                 all_rows.append({
                     "block_time": bt,
-                    "block_date": bt.normalize(),
+                    "block_date": bt.normalize() if not pd.isna(bt) else None,
                     "transaction_hash": t.get("transactionHash"),
                     "transaction_type": direction,
                     "trader_id": t.get("walletAddress"),
                     "pair_address": t.get("pairAddress"),
                     "pair_label": t.get("pairLabel"),
                     "exchange_name": t.get("exchangeName"),
-                    "token_bought_mint_address": bought.get("address") if direction == "buy" else sold.get("address"),
+                    "token_bought_mint_address": (bought.get("address") if direction == "buy" else sold.get("address")) if (bought or sold) else None,
                     "token_bought_amount": token_bought_amt,
-                    "token_sold_mint_address": sold.get("address") if direction == "buy" else bought.get("address"),
+                    "token_sold_mint_address": (sold.get("address") if direction == "buy" else bought.get("address")) if (bought or sold) else None,
                     "token_sold_amount": token_sold_amt,
                     "amount_usd": amount_usd,
                     "price_usd_at_trade": price_usd_at_trade
                 })
 
-            cursor = data.get("cursor")
+            if isinstance(data, dict):
+                cursor = data.get("cursor") or data.get("next")
+            else:
+                cursor = None
+
             if not cursor:
                 break
+
             time.sleep(0.15)
 
         logger.info("[Moralis] fetched %d total trades (so far).", len(all_rows))
@@ -263,10 +395,10 @@ def get_solana_dex_trades(token_addresses: List[str], limit: int = 100) -> pd.Da
         return pd.DataFrame()
 
     df = pd.DataFrame(all_rows)
-    # derived_price fallback
     df["derived_price"] = df["price_usd_at_trade"]
     mask = df["derived_price"].isna() & df["token_bought_amount"].notna() & df["amount_usd"].notna()
-    df.loc[mask, "derived_price"] = df.loc[mask, "amount_usd"] / df.loc[mask, "token_bought_amount"].replace({0: np.nan})
+    if not df.empty and mask.any():
+        df.loc[mask, "derived_price"] = df.loc[mask, "amount_usd"] / df.loc[mask, "token_bought_amount"].replace({0: np.nan})
     df["block_time"] = pd.to_datetime(df["block_time"])
     df = df.sort_values("block_time").reset_index(drop=True)
     logger.info("Total trades fetched: %d", len(df))
@@ -323,12 +455,6 @@ def build_minute_prices_from_trades(trades_df: pd.DataFrame) -> pd.DataFrame:
 # Vectorized price lookup helpers
 # --------------------
 def attach_minute_price(df_in: pd.DataFrame, minute_price_df: pd.DataFrame, mint_col: str, time_col: str, price_col_name: str = "minute_vwap", tolerance_minutes: int = 5) -> pd.DataFrame:
-    """
-    Attach a minute vwap price to df_in:
-      - exact join on (mint, minute)
-      - for misses, perform merge_asof nearest within tolerance
-    Returns df_in with new column price_col_name.
-    """
     if df_in.empty:
         df_in[price_col_name] = np.nan
         return df_in
@@ -339,18 +465,13 @@ def attach_minute_price(df_in: pd.DataFrame, minute_price_df: pd.DataFrame, mint
 
     left = df_in.copy()
     left["minute"] = left[time_col].dt.floor("min")
-    # prepare minute_price_df subset & rename
     mp = minute_price_df[["mint_address", "minute", "vwap"]].rename(columns={"mint_address": mint_col, "vwap": price_col_name})
-    # exact join
     merged = pd.merge(left, mp, on=[mint_col, "minute"], how="left", copy=False)
 
-    # for rows missing price, attempt nearest via merge_asof per mint
     mask_missing = merged[price_col_name].isna()
     if mask_missing.any():
-        # prepare for merge_asof: both must be sorted
         left_asof = merged[mask_missing].sort_values([mint_col, "minute"]).copy()
         right_asof = mp.sort_values([mint_col, "minute"]).copy()
-        # perform asof by grouping by mint_col: pandas.merge_asof supports 'by' argument
         try:
             left_asof = pd.merge_asof(
                 left_asof.sort_values("minute"),
@@ -360,7 +481,6 @@ def attach_minute_price(df_in: pd.DataFrame, minute_price_df: pd.DataFrame, mint
                 direction="nearest",
                 tolerance=pd.Timedelta(minutes=tolerance_minutes)
             )
-            # left_asof will have price_col_name filled where found
             merged.loc[left_asof.index, price_col_name] = left_asof[price_col_name].values
         except Exception as e:
             logger.debug("merge_asof fallback failed: %s", e)
@@ -426,14 +546,7 @@ async def get_current_prices_for_mints_async(mints: List[str]) -> dict:
 # Helius RPC helpers (async)
 # --------------------
 async def fetch_solana_rpc(payload: dict) -> dict:
-    start = time.time()
-    async with aiohttp.ClientSession() as session:
-        async with session.post(HELIUS_RPC_URL, json=payload, timeout=30) as resp:
-            elapsed = time.time() - start
-            if elapsed > LONG_CALL_THRESHOLD:
-                logger.warning("Long Helius RPC call method=%s elapsed=%.2fs", payload.get("method"), elapsed)
-            resp.raise_for_status()
-            return await resp.json()
+    return await aiohttp_with_failover_post(payload, max_attempts=max(6, len(HELIUS_KEYS) * 2 if HELIUS_KEYS else 6))
 
 async def get_current_balances_and_prices(traders: List[str], token_mints: List[str]) -> pd.DataFrame:
     token_mints = list({m.strip() for m in token_mints})
@@ -441,7 +554,6 @@ async def get_current_balances_and_prices(traders: List[str], token_mints: List[
     all_rows = []
 
     for trader in traders:
-        # SOL balance
         sol_payload = {"jsonrpc":"2.0","id":1,"method":"getBalance","params":[trader]}
         try:
             sol_res = await fetch_solana_rpc(sol_payload)
@@ -451,7 +563,6 @@ async def get_current_balances_and_prices(traders: List[str], token_mints: List[
             logger.debug("SOL balance fetch failed for %s: %s", trader, e)
             sol_balance = 0.0
 
-        # token accounts
         tokens_payload = {
             "jsonrpc":"2.0","id":"1","method":"getTokenAccountsByOwner",
             "params":[trader, {"programId":"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"}, {"encoding":"jsonParsed"}]
@@ -504,31 +615,26 @@ def run_pipeline(tokens: List[str],
         raise ValueError("A maximum of 3 token addresses is allowed.")
     logger.info("[Run] tokens=%s window=%s minbuy=%s minprof=%s", tokens, early_trading_window_hours, minimum_initial_buy_usd, min_profitable_trades)
 
-    # 1) fetch trades
     trades_df = get_solana_dex_trades(tokens)
     if trades_df.empty:
         logger.info("No trades returned from Moralis.")
         return
 
-    # 2) build minute price table (VWAP)
     minute_price_df = build_minute_prices_from_trades(trades_df)
-
-    # 3) token launch times
     token_first_trade_times = trades_df.groupby("token_bought_mint_address", as_index=False).agg(token_launch_time=("block_time","min"))
 
-    # 4) earliest buy per trader+token (first_personal_buy_time)
     buys_mask = trades_df["token_bought_amount"].notna() & (trades_df["token_bought_amount"] > 0)
     buys_only = trades_df[buys_mask].copy()
-    idx = buys_only.groupby(["trader_id","token_bought_mint_address"])["block_time"].idxmin()
-    tfbd = buys_only.loc[idx].copy()
-    tfbd = tfbd.rename(columns={"block_time":"first_personal_buy_time"})
-    tfbd = tfbd[["trader_id","token_bought_mint_address","first_personal_buy_time","token_bought_amount","amount_usd","derived_price","block_date"]]
+    if not buys_only.empty:
+        idx = buys_only.groupby(["trader_id","token_bought_mint_address"])["block_time"].idxmin()
+        tfbd = buys_only.loc[idx].copy()
+        tfbd = tfbd.rename(columns={"block_time":"first_personal_buy_time"})
+        tfbd = tfbd[["trader_id","token_bought_mint_address","first_personal_buy_time","token_bought_amount","amount_usd","derived_price","block_date"]]
+    else:
+        tfbd = pd.DataFrame(columns=["trader_id","token_bought_mint_address","first_personal_buy_time","token_bought_amount","amount_usd","derived_price","block_date"])
 
-    # 5) compute first_buy_usd_amount (vectorized)
     if not tfbd.empty:
-        # attach minute vwap
         tfbd = attach_minute_price(tfbd, minute_price_df, mint_col="token_bought_mint_address", time_col="first_personal_buy_time", price_col_name="minute_vwap", tolerance_minutes=5)
-        # compute usd
         cond_amount_usd = tfbd["amount_usd"].notna() & (tfbd["amount_usd"] > 0)
         cond_minute = tfbd["minute_vwap"].notna() & tfbd["token_bought_amount"].notna()
         cond_derived = tfbd["derived_price"].notna() & tfbd["token_bought_amount"].notna()
@@ -540,7 +646,6 @@ def run_pipeline(tokens: List[str],
     else:
         tfbd["first_buy_usd_amount"] = pd.Series(dtype=float)
 
-    # 6) Build cohort (apply optional filters)
     merged_for_cohort = pd.merge(tfbd, token_first_trade_times, on="token_bought_mint_address", how="left")
     merged_for_cohort["time_since_launch"] = merged_for_cohort["first_personal_buy_time"] - merged_for_cohort["token_launch_time"]
 
@@ -557,16 +662,11 @@ def run_pipeline(tokens: List[str],
         logger.info("No traders meeting conditions. Exiting.")
         return
 
-    # -------------------------------------------------------------------------
-    # compute acquisition, sales realized, current networth, combine to token metrics
-    # -------------------------------------------------------------------------
     cohort_trades_df = trades_df[trades_df["trader_id"].isin(early_traders_cohort)].copy()
 
-    # Acquisition: attach minute vwap to buys (vectorized)
     buys = cohort_trades_df[cohort_trades_df["token_bought_amount"].notna() & (cohort_trades_df["token_bought_amount"] > 0)].copy()
     if not buys.empty:
         buys = attach_minute_price(buys, minute_price_df, mint_col="token_bought_mint_address", time_col="block_time", price_col_name="minute_vwap", tolerance_minutes=5)
-        # compute buy_usd_spent: prefer amount_usd else minute_vwap*qty else derived_price*qty
         cond_amount_usd = buys["amount_usd"].notna() & (buys["amount_usd"] > 0)
         cond_minute = buys["minute_vwap"].notna() & buys["token_bought_amount"].notna()
         cond_derived = buys["derived_price"].notna() & buys["token_bought_amount"].notna()
@@ -584,7 +684,6 @@ def run_pipeline(tokens: List[str],
     acquisition["avg_buy_price_usd"] = acquisition["total_usd_spent"] / acquisition["total_tokens_bought"].replace({0: np.nan})
     acquisition = acquisition.rename(columns={"token_bought_mint_address":"mint_address"})
 
-    # Sales: attach minute vwap to sells (vectorized)
     sells = cohort_trades_df[cohort_trades_df["token_sold_amount"].notna() & (cohort_trades_df["token_sold_amount"] > 0)].copy()
     if not sells.empty:
         sells = attach_minute_price(sells, minute_price_df, mint_col="token_sold_mint_address", time_col="block_time", price_col_name="minute_vwap", tolerance_minutes=5)
@@ -598,7 +697,6 @@ def run_pipeline(tokens: List[str],
     else:
         sells["sell_revenue_usd"] = pd.Series(dtype=float)
 
-    # join with acquisition avg buy price for cost basis
     sells = pd.merge(
         sells,
         acquisition[["trader_id","mint_address","avg_buy_price_usd"]],
@@ -614,7 +712,6 @@ def run_pipeline(tokens: List[str],
         realized_profit_usd=("realized_pnl_usd","sum")
     ).rename(columns={"token_sold_mint_address":"mint_address"})
 
-    # Combine acquisition + sales
     trader_token_metrics = pd.merge(
         acquisition,
         sales_profit,
@@ -622,11 +719,9 @@ def run_pipeline(tokens: List[str],
         how="left"
     ).fillna({"total_sales_revenue_usd":0.0,"realized_profit_usd":0.0})
 
-    # Fetch current balances/prices
     token_mints_to_fetch = trader_token_metrics["mint_address"].dropna().unique().tolist()
     balances_df = asyncio.run(get_current_balances_and_prices(list(early_traders_cohort), token_mints_to_fetch))
 
-    # ensure rows for missing pairs
     if balances_df.empty:
         rows = []
         for t in early_traders_cohort:
@@ -634,7 +729,6 @@ def run_pipeline(tokens: List[str],
                 rows.append({"trader_id":t,"mint_address":m,"token_balance":0.0,"current_price":0.0,"current_value_usd":0.0,"sol_balance":0.0})
         balances_df = pd.DataFrame(rows)
 
-    # Merge balances into token metrics
     trader_token_metrics = pd.merge(
         trader_token_metrics,
         balances_df[["trader_id","mint_address","token_balance","current_price","current_value_usd"]],
@@ -642,14 +736,12 @@ def run_pipeline(tokens: List[str],
         how="left"
     ).fillna({"token_balance":0.0,"current_price":0.0,"current_value_usd":0.0})
 
-    # Compute unrealised & token_total_pnl
     trader_token_metrics["avg_buy_price_usd"] = trader_token_metrics["avg_buy_price_usd"].fillna(0.0)
     trader_token_metrics["unrealized_cost_basis"] = trader_token_metrics["token_balance"] * trader_token_metrics["avg_buy_price_usd"]
     trader_token_metrics["estimated_unrealised_pnl"] = trader_token_metrics["current_value_usd"] - trader_token_metrics["unrealized_cost_basis"]
     trader_token_metrics["token_total_pnl"] = trader_token_metrics["realized_profit_usd"].fillna(0.0) + trader_token_metrics["estimated_unrealised_pnl"].fillna(0.0)
     trader_token_metrics["is_token_profitable"] = (trader_token_metrics["token_total_pnl"] > 0).astype(int)
 
-    # Aggregate to trader level (final summary)
     final_summary = trader_token_metrics.groupby("trader_id", as_index=False).agg(
         overall_total_usd_spent=("total_usd_spent","sum"),
         overall_total_sales_revenue=("total_sales_revenue_usd","sum"),
@@ -667,11 +759,9 @@ def run_pipeline(tokens: List[str],
     trade_counts = cohort_trades_df.groupby("trader_id").size().reset_index(name="number_of_trades")
     final_summary = pd.merge(final_summary, trade_counts, on="trader_id", how="left").fillna(0)
 
-    # final filter: require min_profitable_trades profitable tokens
     final_summary = final_summary[final_summary["num_tokens_in_profit"] >= min_profitable_trades]
     final_summary = final_summary.sort_values(by=["ROI","overall_total_usd_spent"], ascending=[False,False]).reset_index(drop=True)
 
-    # display columns
     display_cols = [
         "trader_id","overall_current_value_of_holdings_usd","overall_total_pnl","overall_realized_profit_usd",
         "overall_estimated_unrealised_pnl","ROI","overall_total_usd_spent","overall_total_sales_revenue",
@@ -682,13 +772,11 @@ def run_pipeline(tokens: List[str],
             final_summary[c] = 0.0
 
     logger.info("--- 🏆 Final Early Trader Profitability Report (top 50) ---")
-    # pretty print
     if final_summary.empty:
         logger.info("Final summary empty after filtering.")
     else:
         print(final_summary[display_cols].head(50).to_string(index=False))
 
-    # Save + upload to Supabase (with metadata)
     params = {
         "early_trading_window_hours": early_trading_window_hours,
         "minimum_initial_buy_usd": minimum_initial_buy_usd,
@@ -707,13 +795,19 @@ def run_pipeline(tokens: List[str],
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Solana Early Trader PNL Analysis (up to 3 tokens)")
     parser.add_argument("tokens", nargs="+", help="List of 1-3 token mint addresses (positional)")
-    parser.add_argument("--window", type=int, default=DEFAULT_EARLY_WINDOW_HOURS, help="Early trading window (hours) - optional")
+    parser.add_argument("--window", type=int, default=None, help="Early trading window (hours) - optional")
     parser.add_argument("--minbuy", type=float, default=DEFAULT_MINIMUM_INITIAL_BUY_USD, help="Minimum initial buy in USD - optional")
     parser.add_argument("--minprof", type=int, default=DEFAULT_MIN_PROFITABLE_TRADES, help="Minimum number of profitable tokens")
     args = parser.parse_args()
 
     if len(args.tokens) > 3:
         parser.error("A maximum of 3 token addresses is allowed.")
+
+    try:
+        ensure_keys_present(require_supabase=False)
+    except Exception as e:
+        logger.error("Key validation failed: %s", e)
+        raise
 
     run_pipeline(tokens=args.tokens,
                  early_trading_window_hours=args.window,
