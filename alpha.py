@@ -14,10 +14,7 @@ Notes:
      HELIUS_KEYS  (comma-separated) or HELIUS_API_KEY  (legacy single; also accepts comma-separated)
  - Requires SUPABASE_URL, SUPABASE_KEY to upload/list analyses.
  - Caches Dexscreener current prices in sol_price_cache.pkl using joblib.
- - This corrected version:
-     * DOES NOT permanently blacklist any key.
-     * Will attempt *all provided keys* (shuffled) before failing.
-     * Picks a randomized try order per call so parallel callers use different keys.
+ - If a request returns 401 or 429 the code will rotate to the next key and retry.
 """
 
 import os
@@ -31,7 +28,6 @@ import asyncio
 import aiohttp
 import json
 import logging
-import random
 import math
 from datetime import timedelta, datetime, timezone
 from typing import List, Optional, Dict, Any
@@ -45,7 +41,14 @@ load_dotenv()
 # --------------------
 CACHE_FILE = "sol_price_cache.pkl"
 
+# Support both single-key env var and comma-separated multi-key env var.
+# Also handle the case where the user accidentally placed comma-separated keys in the single var.
 def _load_keys(env_name_single: str, env_name_multi: str) -> List[str]:
+    """
+    Attempt to load keys from env_name_multi first (preferred). If not present,
+    fall back to env_name_single. If either contains commas, split them.
+    Returns a list of stripped keys (no empty entries).
+    """
     multi = os.environ.get(env_name_multi)
     single = os.environ.get(env_name_single)
 
@@ -53,6 +56,7 @@ def _load_keys(env_name_single: str, env_name_multi: str) -> List[str]:
     if multi:
         keys = [k.strip() for k in multi.split(",") if k.strip()]
     elif single:
+        # allow the single variable to contain a comma-separated list as well
         if "," in single:
             keys = [k.strip() for k in single.split(",") if k.strip()]
         else:
@@ -64,6 +68,7 @@ HELIUS_KEYS = _load_keys("HELIUS_API_KEY", "HELIUS_KEYS")
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+# set your bucket name here
 BUCKET_NAME = os.getenv("SUPABASE_BUCKET", "monitor-data")
 
 DEFAULT_EARLY_WINDOW_HOURS = 6
@@ -89,6 +94,14 @@ logger = logging.getLogger("alpha")
 # threshold (seconds) to warn for long RPC/API calls
 LONG_CALL_THRESHOLD = float(os.environ.get("LONG_CALL_THRESHOLD", 2.0))
 
+# simple counters for round-robin rotation
+_moralis_idx = 0
+_helius_idx = 0
+
+# sets to hold bad keys (soft blacklist) to avoid repeatedly trying known-401 keys
+_bad_moralis_keys = set()
+_bad_helius_keys = set()
+
 # --------------------
 # Helpers
 # --------------------
@@ -99,7 +112,6 @@ def _safe_float(v):
         return None
 
 def ensure_keys_present(require_supabase: bool = False):
-    # We require keys arrays to exist (even if empty, we'll error).
     if not MORALIS_KEYS:
         raise RuntimeError("MORALIS_API_KEY / MORALIS_KEYS not set in environment (no Moralis keys found)")
     if not HELIUS_KEYS:
@@ -108,7 +120,8 @@ def ensure_keys_present(require_supabase: bool = False):
         if not SUPABASE_URL or not SUPABASE_KEY:
             raise RuntimeError("SUPABASE_URL or SUPABASE_KEY not set in environment")
 
-def _mask_key(s: Optional[str], keep: int = 6) -> str:
+def _mask_key(s: str, keep: int = 6) -> str:
+    """Return a masked version of a key (show last `keep` chars)."""
     if not s:
         return "None"
     s = str(s)
@@ -116,23 +129,40 @@ def _mask_key(s: Optional[str], keep: int = 6) -> str:
         return s
     return "..." + s[-keep:]
 
-def _build_try_order(keys: List[str], max_attempts: int) -> List[str]:
-    """
-    Build a randomized order of keys to try for up to max_attempts.
-    We shuffle the keys and repeat them until we have at least max_attempts entries.
-    This guarantees that all keys will be attempted (in a random order) before repeats.
-    """
-    if not keys:
-        return []
-    # Shuffle a copy to avoid global state changes
-    keys_copy = keys.copy()
-    random.shuffle(keys_copy)
-    order = []
-    while len(order) < max_attempts:
-        # append a fresh shuffle each round to vary order across cycles
-        random.shuffle(keys_copy)
-        order.extend(keys_copy)
-    return order[:max_attempts]
+def _valid_moralis_keys() -> List[str]:
+    """Return Moralis keys excluding soft-blacklisted ones."""
+    return [k for k in MORALIS_KEYS if k not in _bad_moralis_keys]
+
+def _valid_helius_keys() -> List[str]:
+    """Return Helius keys excluding soft-blacklisted ones."""
+    return [k for k in HELIUS_KEYS if k not in _bad_helius_keys]
+
+def _next_moralis_key_round_robin() -> str:
+    """Pick next Moralis key from non-blacklisted keys using a round-robin counter."""
+    global _moralis_idx
+    valid = _valid_moralis_keys()
+    if not valid:
+        # If nothing valid, consider all keys (reset blacklist) to allow retries
+        logger.error("All Moralis keys are currently blacklisted (removed due to 401). Raise error.")
+        raise RuntimeError("No valid Moralis keys available (all keys returned 401).")
+    key = valid[_moralis_idx % len(valid)]
+    used_idx = _moralis_idx
+    _moralis_idx += 1
+    logger.debug("[moralis] using key idx_round=%d masked=%s", used_idx, _mask_key(key))
+    return key
+
+def _next_helius_key_round_robin() -> str:
+    """Pick next Helius key from non-blacklisted keys using a round-robin counter."""
+    global _helius_idx
+    valid = _valid_helius_keys()
+    if not valid:
+        logger.error("All Helius keys are currently blacklisted (removed due to 401). Raise error.")
+        raise RuntimeError("No valid Helius keys available (all keys returned 401).")
+    key = valid[_helius_idx % len(valid)]
+    used_idx = _helius_idx
+    _helius_idx += 1
+    logger.debug("[helius] using key idx_round=%d masked=%s", used_idx, _mask_key(key))
+    return key
 
 # --------------------
 # Supabase helpers
@@ -172,7 +202,6 @@ def save_to_supabase(df: pd.DataFrame, tokens: List[str], params: Dict[str, Any]
         filename = os.path.basename(local_path)
         object_path = _supabase_path(folder, filename)
         try:
-            # remove if exists (safe to ignore errors)
             supabase.storage.from_(BUCKET_NAME).remove([object_path])
         except Exception:
             pass
@@ -209,47 +238,55 @@ def list_recent_analyses(limit: int = 100, folder: str = "recent_analyses") -> L
     return results
 
 # --------------------
-# Request failover helpers (no permanent blacklisting)
+# Request failover helpers
 # --------------------
 def requests_with_failover(url: str, method: str = "GET", params: dict = None, headers: dict = None,
-                           json_payload: dict = None, max_attempts: Optional[int] = None,
-                           provider: str = "moralis", timeout: int = 20):
+                           json_payload: dict = None, max_attempts: int = None, provider: str = "moralis", timeout: int = 20):
     """
     Synchronous requests wrapper that rotates keys on 401/429 responses or connection errors.
+    - provider: "moralis" supported for sync usage
     Behavior:
-     - For Moralis: try all MORALIS_KEYS (randomized order) up to max_attempts
-     - For other providers: standard retry loop without key injection
-     - Does NOT permanently blacklist keys; it only retries with other keys.
+     - rotate across keys that are not soft-blacklisted
+     - if a key returns 401, mark it as bad and skip it in the future
+     - on 429 (rate limit) treat as transient and continue rotating
     """
     attempt = 0
     last_exception = None
-
-    # default attempts: at least 6 or twice number of keys available (if moralis)
+    # default attempts: at least 6 or twice number of keys available
     if max_attempts is None:
         max_attempts = max(6, (len(MORALIS_KEYS) if MORALIS_KEYS else 1) * 2)
 
-    # For moralis, build a try order so all keys are attempted before repeating
-    try_order = None
-    if provider == "moralis":
-        try_order = _build_try_order(MORALIS_KEYS, max_attempts)
-
     while attempt < max_attempts:
-        key = None
-        if provider == "moralis":
-            key = try_order[attempt]  # safe because try_order length == max_attempts
         attempt += 1
         try:
-            use_headers = dict(headers or {})
-            if provider == "moralis" and key:
+            if provider == "moralis":
+                # pick next valid moralis key
+                try:
+                    key = _next_moralis_key_round_robin()
+                except RuntimeError as e:
+                    # no valid keys left
+                    raise
+                use_headers = dict(headers or {})
                 use_headers["Accept"] = "application/json"
                 use_headers["X-API-Key"] = key
-            resp = requests.request(method, url, params=params, headers=use_headers,
-                                    json=json_payload, timeout=timeout)
+                resp = requests.request(method, url, params=params, headers=use_headers, json=json_payload, timeout=timeout)
+            else:
+                use_headers = dict(headers or {})
+                resp = requests.request(method, url, params=params, headers=use_headers, json=json_payload, timeout=timeout)
 
-            if resp.status_code in (401, 429):
-                logger.warning("[%s] request returned %s (key=%s attempt=%d). Retrying with another key...",
-                               provider, resp.status_code, _mask_key(key), attempt)
+            # handle status codes
+            if resp.status_code == 401:
+                # mark this key as bad (soft blacklist) to avoid trying it repeatedly
+                if provider == "moralis":
+                    _bad_moralis_keys.add(key)
+                    logger.warning("[moralis] key masked=%s returned 401; blacklisting this key index.", _mask_key(key))
+                logger.warning("[%s] request returned 401 (attempt %d). Rotating key and retrying...", provider, attempt)
                 time.sleep(min(1 + attempt * 0.5, 5.0))
+                continue
+
+            if resp.status_code == 429:
+                logger.warning("[%s] request returned 429 (rate limited) (attempt %d). Rotating key and retrying...", provider, attempt)
+                time.sleep(min(0.8 + attempt * 0.5, 5.0))
                 continue
 
             resp.raise_for_status()
@@ -259,29 +296,28 @@ def requests_with_failover(url: str, method: str = "GET", params: dict = None, h
                 return {"_raw_text": resp.text}
         except requests.RequestException as e:
             last_exception = e
-            logger.warning("[%s] request exception (attempt %d, key=%s): %s", provider, attempt, _mask_key(key), e)
+            logger.warning("[%s] request exception (attempt %d): %s", provider, attempt, e)
             time.sleep(min(0.5 * attempt, 5.0))
             continue
 
     raise RuntimeError(f"All attempts failed for {provider}. Last exception: {last_exception}")
 
-async def aiohttp_with_failover_post(payload: dict, max_attempts: Optional[int] = None, timeout: int = 30) -> dict:
+async def aiohttp_with_failover_post(payload: dict, max_attempts: int = None, timeout: int = 30) -> dict:
     """
     Async wrapper to POST to Helius RPC, rotating through HELIUS_KEYS on 429/401 & retrying.
     Returns parsed json.
-    Does NOT permanently blacklist keys; it just retries with other keys.
     """
     attempt = 0
     last_exc = None
-
     if max_attempts is None:
         max_attempts = max(6, (len(HELIUS_KEYS) if HELIUS_KEYS else 1) * 2)
 
-    try_order = _build_try_order(HELIUS_KEYS, max_attempts)
-
     while attempt < max_attempts:
-        key = try_order[attempt]
         attempt += 1
+        try:
+            key = _next_helius_key_round_robin()
+        except RuntimeError:
+            raise
         helius_url = f"https://mainnet.helius-rpc.com/?api-key={key}"
         try:
             start = time.time()
@@ -290,16 +326,21 @@ async def aiohttp_with_failover_post(payload: dict, max_attempts: Optional[int] 
                     elapsed = time.time() - start
                     if elapsed > LONG_CALL_THRESHOLD:
                         logger.warning("Long Helius RPC call method=%s elapsed=%.2fs", payload.get("method"), elapsed)
-                    if resp.status in (401, 429):
-                        logger.warning("[helius] returned %s (key=%s attempt=%d). Retrying with another key...",
-                                       resp.status, _mask_key(key), attempt)
+                    if resp.status == 401:
+                        # blacklist this key
+                        _bad_helius_keys.add(key)
+                        logger.warning("[helius] key masked=%s returned 401; blacklisting this key index.", _mask_key(key))
+                        await asyncio.sleep(min(0.5 * attempt, 5.0))
+                        continue
+                    if resp.status == 429:
+                        logger.warning("[helius] returned 429 (rate limited) on attempt %d, rotating key...", attempt)
                         await asyncio.sleep(min(0.5 * attempt, 5.0))
                         continue
                     resp.raise_for_status()
                     return await resp.json()
         except Exception as e:
             last_exc = e
-            logger.warning("[helius] exception on attempt %d key=%s: %s", attempt, _mask_key(key), e)
+            logger.warning("[helius] exception on attempt %d: %s", attempt, e)
             await asyncio.sleep(min(0.5 * attempt, 5.0))
             continue
 
@@ -337,15 +378,14 @@ def get_solana_dex_trades(token_addresses: List[str], limit: int = 100) -> pd.Da
                 params["cursor"] = cursor
             try:
                 data = requests_with_failover(url, method="GET", params=params, provider="moralis",
-                                              max_attempts=max(6, (len(MORALIS_KEYS) if MORALIS_KEYS else 1) * 2))
+                                              max_attempts=max(6, len(MORALIS_KEYS) * 2 if MORALIS_KEYS else 6))
             except Exception as e:
                 logger.error("[Moralis] request error for %s: %s", addr, e)
                 break
 
             trades = []
             if isinstance(data, dict):
-                # Moralis uses "result" or "result.data"
-                trades = data.get("result", []) or data.get("result", {}).get("data", []) or []
+                trades = data.get("result", []) or data.get("result", {}).get("data", []) or data.get("result", []) or []
             elif isinstance(data, list):
                 trades = data
             else:
@@ -386,9 +426,8 @@ def get_solana_dex_trades(token_addresses: List[str], limit: int = 100) -> pd.Da
                     "price_usd_at_trade": price_usd_at_trade
                 })
 
-            # Moralis pagination cursors vary; try common keys
             if isinstance(data, dict):
-                cursor = data.get("cursor") or data.get("next") or data.get("result", {}).get("cursor")
+                cursor = data.get("cursor") or data.get("next")
             else:
                 cursor = None
 
@@ -553,9 +592,8 @@ async def get_current_prices_for_mints_async(mints: List[str]) -> dict:
 # --------------------
 # Helius RPC helpers (async)
 # --------------------
-async def fetch_solana_rpc(payload: dict, max_attempts: Optional[int] = None) -> dict:
-    # wrapper to pass along max_attempts if desired
-    return await aiohttp_with_failover_post(payload, max_attempts=max_attempts or max(6, (len(HELIUS_KEYS) if HELIUS_KEYS else 1) * 2))
+async def fetch_solana_rpc(payload: dict) -> dict:
+    return await aiohttp_with_failover_post(payload, max_attempts=max(6, len(HELIUS_KEYS) * 2 if HELIUS_KEYS else 6))
 
 async def get_current_balances_and_prices(traders: List[str], token_mints: List[str]) -> pd.DataFrame:
     token_mints = list({m.strip() for m in token_mints})
@@ -604,7 +642,6 @@ async def get_current_balances_and_prices(traders: List[str], token_mints: List[
                 "current_value_usd": bal * price
             })
 
-        # polite spacing between owners
         await asyncio.sleep(0.05)
 
     return pd.DataFrame(all_rows)
