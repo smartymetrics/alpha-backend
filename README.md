@@ -7,3 +7,4 @@ FastAPI + Python backend for Solana Early Trader ROI analysis.
 ```bash
 pip install -r requirements.txt
 uvicorn api:app --reload
+ 

@@ -58,7 +58,7 @@ def analyze(req: AnalysisRequest):
         early_trading_window_hours=req.window if req.trader_type == "early" else None,
         minimum_initial_buy_usd=req.min_buy,
         min_profitable_trades=req.min_num_tokens_in_profit,
-    )
+    ) 
 
     if result is None or result.empty:
         return {"records": [], "tokens": req.tokens, "params": req.dict()}
