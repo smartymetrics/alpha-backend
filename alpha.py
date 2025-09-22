@@ -489,23 +489,48 @@ def get_solana_dex_trades(token_addresses: List[str], limit: int = 100) -> pd.Da
 # Price builder (per-minute OHLC + vwap)
 # --------------------
 def build_minute_prices_from_trades(trades_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build OHLCV + VWAP minute-level candlesticks for base tokens from trade data.
+    
+    Args:
+        trades_df: DataFrame with at least:
+            - block_time (datetime)
+            - base_mint_address
+            - price_usd_at_trade or derived_price
+            - amount_usd
+
+    Returns:
+        DataFrame with columns:
+            mint_address, minute, open, high, low, close, vwap, volume_usd
+    """
     if trades_df.empty:
-        return pd.DataFrame(columns=["mint_address","minute","open","high","low","close","vwap","volume_usd"])
+        return pd.DataFrame(columns=[
+            "mint_address","minute","open","high","low","close","vwap","volume_usd"
+        ])
 
     df = trades_df.copy()
+
+    # Prefer price_usd_at_trade, fallback to derived_price
     df["price_for_price_series"] = df["price_usd_at_trade"].fillna(df["derived_price"])
+
+    # Round down to the nearest minute
     df["minute"] = df["block_time"].dt.floor("min")
-    grouped = df.groupby(["token_bought_mint_address", "minute"], sort=True)
+
+    # Group by base token + minute
+    grouped = df.groupby(["base_mint_address", "minute"], sort=True)
 
     rows = []
     for (mint, minute), g in grouped:
         prices = g["price_for_price_series"].dropna()
         if prices.empty:
             continue
+
         open_p = prices.iloc[0]
         high_p = prices.max()
         low_p = prices.min()
         close_p = prices.iloc[-1]
+
+        # VWAP calculation
         if g["amount_usd"].notna().any():
             weights = g["amount_usd"].fillna(0.0)
             denom = weights.sum()
@@ -515,7 +540,10 @@ def build_minute_prices_from_trades(trades_df: pd.DataFrame) -> pd.DataFrame:
                 vwap = prices.mean()
         else:
             vwap = prices.mean()
+
+        # Total traded volume (in USD terms)
         volume_usd = g["amount_usd"].fillna(0.0).sum()
+
         rows.append({
             "mint_address": mint,
             "minute": minute,
@@ -529,7 +557,8 @@ def build_minute_prices_from_trades(trades_df: pd.DataFrame) -> pd.DataFrame:
 
     price_df = pd.DataFrame(rows)
     if not price_df.empty:
-        price_df = price_df.sort_values(["mint_address","minute"]).reset_index(drop=True)
+        price_df = price_df.sort_values(["mint_address", "minute"]).reset_index(drop=True)
+
     return price_df
 
 # --------------------
