@@ -358,6 +358,14 @@ def _timed_get(url, **kwargs):
     return resp
 
 def get_solana_dex_trades(token_addresses: List[str], limit: int = 100) -> pd.DataFrame:
+    """
+    Normalize Moralis swaps into rows where:
+      - mint_address = the token mint of interest (the token side, not the base)
+      - token_amount = amount of that mint (positive)
+      - other_mint_address/other_amount = counterparty token & amount
+      - is_buy = True when trader acquired the token (sold base token to get token)
+    Uses explicit base-token rule: if token_sold_mint_address in BASE_TOKENS then it's a buy.
+    """
     if not isinstance(token_addresses, list):
         raise TypeError("token_addresses must be a list")
     if len(token_addresses) == 0:
@@ -395,17 +403,41 @@ def get_solana_dex_trades(token_addresses: List[str], limit: int = 100) -> pd.Da
                 break
 
             for t in trades:
-                direction = t.get("transactionType")
+                direction = (t.get("transactionType") or "").lower()
                 bought = t.get("bought") or {}
                 sold = t.get("sold") or {}
 
-                amount_usd = _safe_float(t.get("totalValueUsd"))
-                token_bought_amt = _safe_float(bought.get("amount")) if direction == "buy" else _safe_float(sold.get("amount"))
-                token_sold_amt = _safe_float(sold.get("amount")) if direction == "buy" else _safe_float(bought.get("amount"))
+                # raw addresses
+                bought_addr = (bought.get("address") or "").strip()
+                sold_addr = (sold.get("address") or "").strip()
 
+                # Determine is_buy using explicit base-token rule:
+                # - If sold_addr is a base token, trader sold base => they bought the token (is_buy=True)
+                # - Else if bought_addr is a base token, trader bought base => they sold the token (is_buy=False)
+                # - Else fall back to Moralis transactionType
+                if sold_addr and sold_addr in BASE_TOKENS and (not bought_addr or bought_addr not in BASE_TOKENS):
+                    is_buy = True
+                elif bought_addr and bought_addr in BASE_TOKENS and (not sold_addr or sold_addr not in BASE_TOKENS):
+                    is_buy = False
+                else:
+                    is_buy = (direction == "buy")
+
+                # Normalize so mint_address/token_amount always refer to the token of interest
+                if is_buy:
+                    mint_address = bought_addr or None
+                    token_amount = _safe_float(bought.get("amount"))
+                    other_mint_address = sold_addr or None
+                    other_amount = _safe_float(sold.get("amount"))
+                else:
+                    mint_address = sold_addr or None
+                    token_amount = _safe_float(sold.get("amount"))
+                    other_mint_address = bought_addr or None
+                    other_amount = _safe_float(bought.get("amount"))
+
+                amount_usd = _safe_float(t.get("totalValueUsd"))
                 price_usd_at_trade = None
-                if amount_usd is not None and token_bought_amt not in (None, 0):
-                    price_usd_at_trade = amount_usd / token_bought_amt
+                if amount_usd is not None and token_amount not in (None, 0):
+                    price_usd_at_trade = amount_usd / token_amount
 
                 bt = pd.to_datetime(t.get("blockTimestamp"))
 
@@ -414,14 +446,15 @@ def get_solana_dex_trades(token_addresses: List[str], limit: int = 100) -> pd.Da
                     "block_date": bt.normalize() if not pd.isna(bt) else None,
                     "transaction_hash": t.get("transactionHash"),
                     "transaction_type": direction,
+                    "is_buy": is_buy,
                     "trader_id": t.get("walletAddress"),
                     "pair_address": t.get("pairAddress"),
                     "pair_label": t.get("pairLabel"),
                     "exchange_name": t.get("exchangeName"),
-                    "token_bought_mint_address": (bought.get("address") if direction == "buy" else sold.get("address")) if (bought or sold) else None,
-                    "token_bought_amount": token_bought_amt,
-                    "token_sold_mint_address": (sold.get("address") if direction == "buy" else bought.get("address")) if (bought or sold) else None,
-                    "token_sold_amount": token_sold_amt,
+                    "mint_address": mint_address,
+                    "token_amount": token_amount,
+                    "other_mint_address": other_mint_address,
+                    "other_amount": other_amount,
                     "amount_usd": amount_usd,
                     "price_usd_at_trade": price_usd_at_trade
                 })
@@ -442,10 +475,11 @@ def get_solana_dex_trades(token_addresses: List[str], limit: int = 100) -> pd.Da
         return pd.DataFrame()
 
     df = pd.DataFrame(all_rows)
+    # derived_price fallback logic uses token_amount now
     df["derived_price"] = df["price_usd_at_trade"]
-    mask = df["derived_price"].isna() & df["token_bought_amount"].notna() & df["amount_usd"].notna()
+    mask = df["derived_price"].isna() & df["token_amount"].notna() & df["amount_usd"].notna()
     if not df.empty and mask.any():
-        df.loc[mask, "derived_price"] = df.loc[mask, "amount_usd"] / df.loc[mask, "token_bought_amount"].replace({0: np.nan})
+        df.loc[mask, "derived_price"] = df.loc[mask, "amount_usd"] / df.loc[mask, "token_amount"].replace({0: np.nan})
     df["block_time"] = pd.to_datetime(df["block_time"])
     df = df.sort_values("block_time").reset_index(drop=True)
     logger.info("Total trades fetched: %d", len(df))
@@ -662,38 +696,51 @@ def run_pipeline(tokens: List[str],
         raise ValueError("A maximum of 3 token addresses is allowed.")
     logger.info("[Run] tokens=%s window=%s minbuy=%s minprof=%s", tokens, early_trading_window_hours, minimum_initial_buy_usd, min_profitable_trades)
 
+    # Fetch trades and build minute prices
     trades_df = get_solana_dex_trades(tokens)
     if trades_df.empty:
         logger.info("No trades returned from Moralis.")
         return
 
     minute_price_df = build_minute_prices_from_trades(trades_df)
-    token_first_trade_times = trades_df.groupby("token_bought_mint_address", as_index=False).agg(token_launch_time=("block_time","min"))
 
-    buys_mask = trades_df["token_bought_amount"].notna() & (trades_df["token_bought_amount"] > 0)
+    # token launch times per normalized mint_address
+    token_first_trade_times = trades_df.groupby("mint_address", as_index=False).agg(token_launch_time=("block_time", "min"))
+
+    # -------------------------
+    # First personal buy (cohort)
+    # -------------------------
+    buys_mask = trades_df["is_buy"] & trades_df["token_amount"].notna() & (trades_df["token_amount"] > 0)
     buys_only = trades_df[buys_mask].copy()
     if not buys_only.empty:
-        idx = buys_only.groupby(["trader_id","token_bought_mint_address"])["block_time"].idxmin()
+        idx = buys_only.groupby(["trader_id", "mint_address"])["block_time"].idxmin()
         tfbd = buys_only.loc[idx].copy()
-        tfbd = tfbd.rename(columns={"block_time":"first_personal_buy_time"})
-        tfbd = tfbd[["trader_id","token_bought_mint_address","first_personal_buy_time","token_bought_amount","amount_usd","derived_price","block_date"]]
+        tfbd = tfbd.rename(columns={"block_time": "first_personal_buy_time"})
+        tfbd = tfbd[["trader_id", "mint_address", "first_personal_buy_time", "token_amount", "amount_usd", "derived_price", "block_date"]]
     else:
-        tfbd = pd.DataFrame(columns=["trader_id","token_bought_mint_address","first_personal_buy_time","token_bought_amount","amount_usd","derived_price","block_date"])
+        tfbd = pd.DataFrame(columns=["trader_id", "mint_address", "first_personal_buy_time", "token_amount", "amount_usd", "derived_price", "block_date"])
 
     if not tfbd.empty:
-        tfbd = attach_minute_price(tfbd, minute_price_df, mint_col="token_bought_mint_address", time_col="first_personal_buy_time", price_col_name="minute_vwap", tolerance_minutes=5)
+        tfbd = attach_minute_price(tfbd, minute_price_df, mint_col="mint_address", time_col="first_personal_buy_time", price_col_name="minute_vwap", tolerance_minutes=5)
         cond_amount_usd = tfbd["amount_usd"].notna() & (tfbd["amount_usd"] > 0)
-        cond_minute = tfbd["minute_vwap"].notna() & tfbd["token_bought_amount"].notna()
-        cond_derived = tfbd["derived_price"].notna() & tfbd["token_bought_amount"].notna()
+        cond_minute = tfbd["minute_vwap"].notna() & tfbd["token_amount"].notna()
+        cond_derived = tfbd["derived_price"].notna() & tfbd["token_amount"].notna()
 
         tfbd["first_buy_usd_amount"] = 0.0
         tfbd.loc[cond_amount_usd, "first_buy_usd_amount"] = tfbd.loc[cond_amount_usd, "amount_usd"].astype(float)
-        tfbd.loc[~cond_amount_usd & cond_minute, "first_buy_usd_amount"] = (tfbd.loc[~cond_amount_usd & cond_minute, "minute_vwap"].astype(float) * tfbd.loc[~cond_amount_usd & cond_minute, "token_bought_amount"].astype(float))
-        tfbd.loc[~cond_amount_usd & ~cond_minute & cond_derived, "first_buy_usd_amount"] = (tfbd.loc[~cond_amount_usd & ~cond_minute & cond_derived, "derived_price"].astype(float) * tfbd.loc[~cond_amount_usd & ~cond_minute & cond_derived, "token_bought_amount"].astype(float))
+        tfbd.loc[~cond_amount_usd & cond_minute, "first_buy_usd_amount"] = (
+            tfbd.loc[~cond_amount_usd & cond_minute, "minute_vwap"].astype(float)
+            * tfbd.loc[~cond_amount_usd & cond_minute, "token_amount"].astype(float)
+        )
+        tfbd.loc[~cond_amount_usd & ~cond_minute & cond_derived, "first_buy_usd_amount"] = (
+            tfbd.loc[~cond_amount_usd & ~cond_minute & cond_derived, "derived_price"].astype(float)
+            * tfbd.loc[~cond_amount_usd & ~cond_minute & cond_derived, "token_amount"].astype(float)
+        )
     else:
         tfbd["first_buy_usd_amount"] = pd.Series(dtype=float)
 
-    merged_for_cohort = pd.merge(tfbd, token_first_trade_times, on="token_bought_mint_address", how="left")
+    # merge to compute time since launch & cohort filtering
+    merged_for_cohort = pd.merge(tfbd, token_first_trade_times, on="mint_address", how="left")
     merged_for_cohort["time_since_launch"] = merged_for_cohort["first_personal_buy_time"] - merged_for_cohort["token_launch_time"]
 
     cohort_df = merged_for_cohort.copy()
@@ -711,60 +758,80 @@ def run_pipeline(tokens: List[str],
 
     cohort_trades_df = trades_df[trades_df["trader_id"].isin(early_traders_cohort)].copy()
 
-    buys = cohort_trades_df[cohort_trades_df["token_bought_amount"].notna() & (cohort_trades_df["token_bought_amount"] > 0)].copy()
+    # -------------------------
+    # BUYS: normalized path
+    # -------------------------
+    buys = cohort_trades_df[cohort_trades_df["is_buy"] & cohort_trades_df["token_amount"].notna() & (cohort_trades_df["token_amount"] > 0)].copy()
     if not buys.empty:
-        buys = attach_minute_price(buys, minute_price_df, mint_col="token_bought_mint_address", time_col="block_time", price_col_name="minute_vwap", tolerance_minutes=5)
+        buys = attach_minute_price(buys, minute_price_df, mint_col="mint_address", time_col="block_time", price_col_name="minute_vwap", tolerance_minutes=5)
         cond_amount_usd = buys["amount_usd"].notna() & (buys["amount_usd"] > 0)
-        cond_minute = buys["minute_vwap"].notna() & buys["token_bought_amount"].notna()
-        cond_derived = buys["derived_price"].notna() & buys["token_bought_amount"].notna()
+        cond_minute = buys["minute_vwap"].notna() & buys["token_amount"].notna()
+        cond_derived = buys["derived_price"].notna() & buys["token_amount"].notna()
         buys["buy_usd_spent"] = 0.0
         buys.loc[cond_amount_usd, "buy_usd_spent"] = buys.loc[cond_amount_usd, "amount_usd"].astype(float)
-        buys.loc[~cond_amount_usd & cond_minute, "buy_usd_spent"] = (buys.loc[~cond_amount_usd & cond_minute, "minute_vwap"].astype(float) * buys.loc[~cond_amount_usd & cond_minute, "token_bought_amount"].astype(float))
-        buys.loc[~cond_amount_usd & ~cond_minute & cond_derived, "buy_usd_spent"] = (buys.loc[~cond_amount_usd & ~cond_minute & cond_derived, "derived_price"].astype(float) * buys.loc[~cond_amount_usd & ~cond_minute & cond_derived, "token_bought_amount"].astype(float))
+        buys.loc[~cond_amount_usd & cond_minute, "buy_usd_spent"] = (
+            buys.loc[~cond_amount_usd & cond_minute, "minute_vwap"].astype(float)
+            * buys.loc[~cond_amount_usd & cond_minute, "token_amount"].astype(float)
+        )
+        buys.loc[~cond_amount_usd & ~cond_minute & cond_derived, "buy_usd_spent"] = (
+            buys.loc[~cond_amount_usd & ~cond_minute & cond_derived, "derived_price"].astype(float)
+            * buys.loc[~cond_amount_usd & ~cond_minute & cond_derived, "token_amount"].astype(float)
+        )
     else:
         buys["buy_usd_spent"] = pd.Series(dtype=float)
 
-    acquisition = buys.groupby(["trader_id","token_bought_mint_address"], as_index=False).agg(
-        total_usd_spent=("buy_usd_spent","sum"),
-        total_tokens_bought=("token_bought_amount","sum")
+    acquisition = buys.groupby(["trader_id", "mint_address"], as_index=False).agg(
+        total_usd_spent=("buy_usd_spent", "sum"),
+        total_tokens_bought=("token_amount", "sum")
     )
     acquisition["avg_buy_price_usd"] = acquisition["total_usd_spent"] / acquisition["total_tokens_bought"].replace({0: np.nan})
-    acquisition = acquisition.rename(columns={"token_bought_mint_address":"mint_address"})
 
-    sells = cohort_trades_df[cohort_trades_df["token_sold_amount"].notna() & (cohort_trades_df["token_sold_amount"] > 0)].copy()
+    # -------------------------
+    # SELLS: normalized path
+    # -------------------------
+    sells = cohort_trades_df[~cohort_trades_df["is_buy"] & cohort_trades_df["token_amount"].notna() & (cohort_trades_df["token_amount"] > 0)].copy()
     if not sells.empty:
-        sells = attach_minute_price(sells, minute_price_df, mint_col="token_sold_mint_address", time_col="block_time", price_col_name="minute_vwap", tolerance_minutes=5)
+        sells = attach_minute_price(sells, minute_price_df, mint_col="mint_address", time_col="block_time", price_col_name="minute_vwap", tolerance_minutes=5)
         cond_amount_usd = sells["amount_usd"].notna() & (sells["amount_usd"] > 0)
-        cond_minute = sells["minute_vwap"].notna() & sells["token_sold_amount"].notna()
-        cond_derived = sells["derived_price"].notna() & sells["token_sold_amount"].notna()
+        cond_minute = sells["minute_vwap"].notna() & sells["token_amount"].notna()
+        cond_derived = sells["derived_price"].notna() & sells["token_amount"].notna()
         sells["sell_revenue_usd"] = 0.0
         sells.loc[cond_amount_usd, "sell_revenue_usd"] = sells.loc[cond_amount_usd, "amount_usd"].astype(float)
-        sells.loc[~cond_amount_usd & cond_minute, "sell_revenue_usd"] = (sells.loc[~cond_amount_usd & cond_minute, "minute_vwap"].astype(float) * sells.loc[~cond_amount_usd & cond_minute, "token_sold_amount"].astype(float))
-        sells.loc[~cond_amount_usd & ~cond_minute & cond_derived, "sell_revenue_usd"] = (sells.loc[~cond_amount_usd & ~cond_minute & cond_derived, "derived_price"].astype(float) * sells.loc[~cond_amount_usd & ~cond_minute & cond_derived, "token_sold_amount"].astype(float))
+        sells.loc[~cond_amount_usd & cond_minute, "sell_revenue_usd"] = (
+            sells.loc[~cond_amount_usd & cond_minute, "minute_vwap"].astype(float)
+            * sells.loc[~cond_amount_usd & cond_minute, "token_amount"].astype(float)
+        )
+        sells.loc[~cond_amount_usd & ~cond_minute & cond_derived, "sell_revenue_usd"] = (
+            sells.loc[~cond_amount_usd & ~cond_minute & cond_derived, "derived_price"].astype(float)
+            * sells.loc[~cond_amount_usd & ~cond_minute & cond_derived, "token_amount"].astype(float)
+        )
     else:
         sells["sell_revenue_usd"] = pd.Series(dtype=float)
 
+    # Merge sells with acquisition on normalized mint key
     sells = pd.merge(
         sells,
-        acquisition[["trader_id","mint_address","avg_buy_price_usd"]],
-        left_on=["trader_id","token_sold_mint_address"],
-        right_on=["trader_id","mint_address"],
+        acquisition[["trader_id", "mint_address", "avg_buy_price_usd"]],
+        on=["trader_id", "mint_address"],
         how="left"
     )
-    sells["cost_of_goods_sold"] = sells["token_sold_amount"] * sells["avg_buy_price_usd"].fillna(0.0)
+    sells["cost_of_goods_sold"] = sells["token_amount"] * sells["avg_buy_price_usd"].fillna(0.0)
     sells["realized_pnl_usd"] = sells["sell_revenue_usd"].fillna(0.0) - sells["cost_of_goods_sold"].fillna(0.0)
 
-    sales_profit = sells.groupby(["trader_id","token_sold_mint_address"], as_index=False).agg(
-        total_sales_revenue_usd=("sell_revenue_usd","sum"),
-        realized_profit_usd=("realized_pnl_usd","sum")
-    ).rename(columns={"token_sold_mint_address":"mint_address"})
+    sales_profit = sells.groupby(["trader_id", "mint_address"], as_index=False).agg(
+        total_sales_revenue_usd=("sell_revenue_usd", "sum"),
+        realized_profit_usd=("realized_pnl_usd", "sum")
+    )
 
+    # -------------------------
+    # Combine metrics and fetch balances
+    # -------------------------
     trader_token_metrics = pd.merge(
-        acquisition,
+        acquisition.rename(columns={"mint_address": "mint_address"}),
         sales_profit,
-        on=["trader_id","mint_address"],
+        on=["trader_id", "mint_address"],
         how="left"
-    ).fillna({"total_sales_revenue_usd":0.0,"realized_profit_usd":0.0})
+    ).fillna({"total_sales_revenue_usd": 0.0, "realized_profit_usd": 0.0})
 
     token_mints_to_fetch = trader_token_metrics["mint_address"].dropna().unique().tolist()
     balances_df = asyncio.run(get_current_balances_and_prices(list(early_traders_cohort), token_mints_to_fetch))
@@ -773,31 +840,37 @@ def run_pipeline(tokens: List[str],
         rows = []
         for t in early_traders_cohort:
             for m in token_mints_to_fetch:
-                rows.append({"trader_id":t,"mint_address":m,"token_balance":0.0,"current_price":0.0,"current_value_usd":0.0,"sol_balance":0.0})
+                rows.append({"trader_id": t, "mint_address": m, "token_balance": 0.0, "current_price": 0.0, "current_value_usd": 0.0, "sol_balance": 0.0})
         balances_df = pd.DataFrame(rows)
 
     trader_token_metrics = pd.merge(
         trader_token_metrics,
-        balances_df[["trader_id","mint_address","token_balance","current_price","current_value_usd"]],
-        on=["trader_id","mint_address"],
+        balances_df[["trader_id", "mint_address", "token_balance", "current_price", "current_value_usd"]],
+        on=["trader_id", "mint_address"],
         how="left"
-    ).fillna({"token_balance":0.0,"current_price":0.0,"current_value_usd":0.0})
+    ).fillna({"token_balance": 0.0, "current_price": 0.0, "current_value_usd": 0.0})
 
+    # -------------------------
+    # Unrealized / total PnL
+    # -------------------------
     trader_token_metrics["avg_buy_price_usd"] = trader_token_metrics["avg_buy_price_usd"].fillna(0.0)
     trader_token_metrics["unrealized_cost_basis"] = trader_token_metrics["token_balance"] * trader_token_metrics["avg_buy_price_usd"]
     trader_token_metrics["estimated_unrealised_pnl"] = trader_token_metrics["current_value_usd"] - trader_token_metrics["unrealized_cost_basis"]
     trader_token_metrics["token_total_pnl"] = trader_token_metrics["realized_profit_usd"].fillna(0.0) + trader_token_metrics["estimated_unrealised_pnl"].fillna(0.0)
     trader_token_metrics["is_token_profitable"] = (trader_token_metrics["token_total_pnl"] > 0).astype(int)
 
+    # -------------------------
+    # Final summarization per trader
+    # -------------------------
     final_summary = trader_token_metrics.groupby("trader_id", as_index=False).agg(
-        overall_total_usd_spent=("total_usd_spent","sum"),
-        overall_total_sales_revenue=("total_sales_revenue_usd","sum"),
-        overall_realized_profit_usd=("realized_profit_usd","sum"),
-        overall_estimated_unrealised_pnl=("estimated_unrealised_pnl","sum"),
-        overall_current_value_of_holdings_usd=("current_value_usd","sum"),
-        overall_total_pnl=("token_total_pnl","sum"),
-        num_unique_tokens_traded=("mint_address","nunique"),
-        num_tokens_in_profit=("is_token_profitable","sum")
+        overall_total_usd_spent=("total_usd_spent", "sum"),
+        overall_total_sales_revenue=("total_sales_revenue_usd", "sum"),
+        overall_realized_profit_usd=("realized_profit_usd", "sum"),
+        overall_estimated_unrealised_pnl=("estimated_unrealised_pnl", "sum"),
+        overall_current_value_of_holdings_usd=("current_value_usd", "sum"),
+        overall_total_pnl=("token_total_pnl", "sum"),
+        num_unique_tokens_traded=("mint_address", "nunique"),
+        num_tokens_in_profit=("is_token_profitable", "sum")
     )
 
     final_summary["ROI"] = (final_summary["overall_total_pnl"] / final_summary["overall_total_usd_spent"]).replace([np.inf, np.nan], 0).fillna(0)
@@ -807,12 +880,12 @@ def run_pipeline(tokens: List[str],
     final_summary = pd.merge(final_summary, trade_counts, on="trader_id", how="left").fillna(0)
 
     final_summary = final_summary[final_summary["num_tokens_in_profit"] >= min_profitable_trades]
-    final_summary = final_summary.sort_values(by=["ROI","overall_total_usd_spent"], ascending=[False,False]).reset_index(drop=True)
+    final_summary = final_summary.sort_values(by=["ROI", "overall_total_usd_spent"], ascending=[False, False]).reset_index(drop=True)
 
     display_cols = [
-        "trader_id","overall_current_value_of_holdings_usd","overall_total_pnl","overall_realized_profit_usd",
-        "overall_estimated_unrealised_pnl","ROI","overall_total_usd_spent","overall_total_sales_revenue",
-        "num_unique_tokens_traded","num_tokens_in_profit","number_of_trades"
+        "trader_id", "overall_current_value_of_holdings_usd", "overall_total_pnl", "overall_realized_profit_usd",
+        "overall_estimated_unrealised_pnl", "ROI", "overall_total_usd_spent", "overall_total_sales_revenue",
+        "num_unique_tokens_traded", "num_tokens_in_profit", "number_of_trades"
     ]
     for c in display_cols:
         if c not in final_summary.columns:
