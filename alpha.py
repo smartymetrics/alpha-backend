@@ -490,34 +490,51 @@ def get_solana_dex_trades(token_addresses: List[str], limit: int = 100) -> pd.Da
 # --------------------
 def build_minute_prices_from_trades(trades_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Build OHLCV + VWAP minute-level candlesticks for base tokens from trade data.
-    
+    Build OHLCV + VWAP minute-level candlesticks for tokens from trade data.
+
     Args:
         trades_df: DataFrame with at least:
             - block_time (datetime)
-            - base_mint_address
+            - mint_address (str)
             - price_usd_at_trade or derived_price
-            - amount_usd
+            - amount_usd (float)
 
     Returns:
         DataFrame with columns:
             mint_address, minute, open, high, low, close, vwap, volume_usd
     """
     if trades_df.empty:
-        return pd.DataFrame(columns=[
-            "mint_address","minute","open","high","low","close","vwap","volume_usd"
-        ])
+        return pd.DataFrame(
+            columns=[
+                "mint_address",
+                "minute",
+                "open",
+                "high",
+                "low",
+                "close",
+                "vwap",
+                "volume_usd",
+            ]
+        )
 
     df = trades_df.copy()
 
+    # Ensure datetime
+    df["block_time"] = pd.to_datetime(df["block_time"])
+
     # Prefer price_usd_at_trade, fallback to derived_price
-    df["price_for_price_series"] = df["price_usd_at_trade"].fillna(df["derived_price"])
+    if "price_usd_at_trade" in df.columns:
+        df["price_for_price_series"] = df["price_usd_at_trade"].fillna(
+            df.get("derived_price")
+        )
+    else:
+        df["price_for_price_series"] = df.get("derived_price")
 
     # Round down to the nearest minute
     df["minute"] = df["block_time"].dt.floor("min")
 
-    # Group by base token + minute
-    grouped = df.groupby(["base_mint_address", "minute"], sort=True)
+    # Group by token mint + minute
+    grouped = df.groupby(["mint_address", "minute"], sort=True)
 
     rows = []
     for (mint, minute), g in grouped:
@@ -530,8 +547,8 @@ def build_minute_prices_from_trades(trades_df: pd.DataFrame) -> pd.DataFrame:
         low_p = prices.min()
         close_p = prices.iloc[-1]
 
-        # VWAP calculation
-        if g["amount_usd"].notna().any():
+        # VWAP calculation with division-by-zero guard
+        if "amount_usd" in g.columns and g["amount_usd"].notna().any():
             weights = g["amount_usd"].fillna(0.0)
             denom = weights.sum()
             if denom > 0:
@@ -542,22 +559,26 @@ def build_minute_prices_from_trades(trades_df: pd.DataFrame) -> pd.DataFrame:
             vwap = prices.mean()
 
         # Total traded volume (in USD terms)
-        volume_usd = g["amount_usd"].fillna(0.0).sum()
+        volume_usd = g.get("amount_usd", pd.Series(dtype=float)).fillna(0.0).sum()
 
-        rows.append({
-            "mint_address": mint,
-            "minute": minute,
-            "open": open_p,
-            "high": high_p,
-            "low": low_p,
-            "close": close_p,
-            "vwap": vwap,
-            "volume_usd": volume_usd
-        })
+        rows.append(
+            {
+                "mint_address": mint,
+                "minute": minute,
+                "open": open_p,
+                "high": high_p,
+                "low": low_p,
+                "close": close_p,
+                "vwap": vwap,
+                "volume_usd": volume_usd,
+            }
+        )
 
     price_df = pd.DataFrame(rows)
     if not price_df.empty:
-        price_df = price_df.sort_values(["mint_address", "minute"]).reset_index(drop=True)
+        price_df = price_df.sort_values(["mint_address", "minute"]).reset_index(
+            drop=True
+        )
 
     return price_df
 
