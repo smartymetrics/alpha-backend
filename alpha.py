@@ -159,7 +159,7 @@ def _save_blacklist_cache():
         }
         
         # Convert to JSON bytes
-        json_data = json.dumps(data, indent=2).encode('utf-8')
+        json_data = json.dump(data, indent=2).encode('utf-8')
         
         # Remove existing file first (if it exists)
         try:
@@ -391,14 +391,14 @@ def save_to_supabase(df: pd.DataFrame, tokens: List[str], params: Dict[str, Any]
     json_file_name = f"{base_name}.json"
 
     # Create data in memory instead of local files
-    pkl_data = joblib.dumps(df)
+    pkl_data = joblib.dump(df)
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "tokens": tokens,
         "params": params,
         "records": df.fillna(0).to_dict(orient="records")
     }
-    json_data = json.dumps(payload, ensure_ascii=False, indent=2).encode('utf-8')
+    json_data = json.dump(payload, ensure_ascii=False, indent=2).encode('utf-8')
 
     logger.info("Created analysis data in memory: %s and %s", pkl_file_name, json_file_name)
 
