@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 alpha.py - Solana Early Trader PNL Analysis (with API-key rotation + failover,
-           corrected, optimized, Supabase upload, time-based blacklist)
+           corrected, optimized, Supabase upload)
 
 Usage:
     python alpha.py <token_mint1> [token_mint2 token_mint3]
@@ -15,7 +15,6 @@ Notes:
  - Requires SUPABASE_URL, SUPABASE_KEY to upload/list analyses.
  - Caches Dexscreener current prices in sol_price_cache.pkl using joblib.
  - If a request returns 401 or 429 the code will rotate to the next key and retry.
- - Enhanced key management with time-based blacklist expiration (Moralis: 24h, Helius: 14d)
 """
 
 import os
@@ -84,23 +83,6 @@ BASE_TOKENS = {
 }
 
 # --------------------
-# Enhanced Key Management with Time-based Blacklist
-# --------------------
-
-# Blacklist storage - maps provider to dict of {key: blacklist_timestamp}
-_blacklisted_keys: Dict[str, Dict[str, float]] = {
-    "moralis": {},
-    "helius": {}
-}
-
-# Blacklist durations (in seconds)
-MORALIS_BLACKLIST_DURATION = 24 * 60 * 60  # 24 hours
-HELIUS_BLACKLIST_DURATION = 14 * 24 * 60 * 60  # 14 days
-
-# Supabase config for persistence
-BLACKLIST_OBJECT_PATH = "system/api_blacklist_cache.json"
-
-# --------------------
 # Logging
 # --------------------
 logging.basicConfig(
@@ -116,133 +98,9 @@ LONG_CALL_THRESHOLD = float(os.environ.get("LONG_CALL_THRESHOLD", 2.0))
 _moralis_idx = 0
 _helius_idx = 0
 
-# --------------------
-# Enhanced Key Management Functions
-# --------------------
-
-def _get_supabase_client() -> Client:
-    """Get Supabase client for blacklist persistence."""
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        raise RuntimeError("SUPABASE_URL or SUPABASE_KEY not set in environment")
-    return create_client(SUPABASE_URL, SUPABASE_KEY)
-
-def _load_blacklist_cache():
-    """Load blacklist data from Supabase to persist across runs."""
-    global _blacklisted_keys
-    try:
-        supabase = _get_supabase_client()
-        
-        # Try to download the blacklist cache from Supabase
-        response = supabase.storage.from_(BUCKET_NAME).download(BLACKLIST_OBJECT_PATH)
-        
-        if response:
-            data = json.loads(response.decode('utf-8'))
-            _blacklisted_keys = data.get("blacklisted_keys", {"moralis": {}, "helius": {}})
-            logger.debug("Loaded blacklist cache from Supabase: %d moralis, %d helius keys", 
-                       len(_blacklisted_keys["moralis"]), len(_blacklisted_keys["helius"]))
-        else:
-            logger.debug("No existing blacklist cache found in Supabase, starting fresh")
-            _blacklisted_keys = {"moralis": {}, "helius": {}}
-            
-    except Exception as e:
-        logger.warning("Failed to load blacklist cache from Supabase: %s", e)
-        _blacklisted_keys = {"moralis": {}, "helius": {}}
-
-def _save_blacklist_cache():
-    """Save blacklist data to Supabase."""
-    try:
-        supabase = _get_supabase_client()
-        
-        data = {
-            "blacklisted_keys": _blacklisted_keys,
-            "last_updated": datetime.now(timezone.utc).isoformat()
-        }
-        
-        # Convert to JSON bytes
-        json_data = json.dump(data, indent=2).encode('utf-8')
-        
-        # Remove existing file first (if it exists)
-        try:
-            supabase.storage.from_(BUCKET_NAME).remove([BLACKLIST_OBJECT_PATH])
-        except Exception:
-            pass  # File might not exist yet
-        
-        # Upload the new blacklist cache
-        supabase.storage.from_(BUCKET_NAME).upload(BLACKLIST_OBJECT_PATH, json_data)
-        logger.debug("Saved blacklist cache to Supabase")
-        
-    except Exception as e:
-        logger.warning("Failed to save blacklist cache to Supabase: %s", e)
-
-def _clean_expired_blacklisted_keys():
-    """Remove expired keys from blacklist based on their expiration times."""
-    current_time = time.time()
-    
-    # Clean Moralis keys (24-hour expiration)
-    expired_moralis = []
-    for key, blacklist_time in _blacklisted_keys["moralis"].items():
-        if current_time - blacklist_time > MORALIS_BLACKLIST_DURATION:
-            expired_moralis.append(key)
-    
-    for key in expired_moralis:
-        del _blacklisted_keys["moralis"][key]
-        logger.info("Removed expired Moralis key from blacklist: %s", _mask_key(key))
-    
-    # Clean Helius keys (14-day expiration)
-    expired_helius = []
-    for key, blacklist_time in _blacklisted_keys["helius"].items():
-        if current_time - blacklist_time > HELIUS_BLACKLIST_DURATION:
-            expired_helius.append(key)
-    
-    for key in expired_helius:
-        del _blacklisted_keys["helius"][key]
-        logger.info("Removed expired Helius key from blacklist: %s", _mask_key(key))
-    
-    # Save changes if any keys were removed
-    if expired_moralis or expired_helius:
-        _save_blacklist_cache()
-
-def _add_to_blacklist(provider: str, key: str):
-    """Add a key to the blacklist with current timestamp."""
-    current_time = time.time()
-    _blacklisted_keys[provider][key] = current_time
-    
-    # Calculate expiration time for logging
-    if provider == "moralis":
-        expires_at = datetime.fromtimestamp(current_time + MORALIS_BLACKLIST_DURATION, timezone.utc)
-        duration = "24 hours"
-    else:  # helius
-        expires_at = datetime.fromtimestamp(current_time + HELIUS_BLACKLIST_DURATION, timezone.utc)
-        duration = "14 days"
-    
-    logger.warning("Added %s key to blacklist (expires in %s at %s): %s", 
-                   provider, duration, expires_at.strftime("%Y-%m-%d %H:%M UTC"), _mask_key(key))
-    _save_blacklist_cache()
-
-def _is_blacklisted(provider: str, key: str) -> bool:
-    """Check if a key is currently blacklisted (not expired)."""
-    if key not in _blacklisted_keys[provider]:
-        return False
-    
-    current_time = time.time()
-    blacklist_time = _blacklisted_keys[provider][key]
-    
-    duration_limit = MORALIS_BLACKLIST_DURATION if provider == "moralis" else HELIUS_BLACKLIST_DURATION
-    
-    return (current_time - blacklist_time) <= duration_limit
-
-def _initialize_blacklist_cache():
-    """Initialize blacklist cache with proper error handling."""
-    try:
-        if SUPABASE_URL and SUPABASE_KEY:
-            _load_blacklist_cache()
-        else:
-            logger.warning("Supabase credentials not available, blacklist will not persist across runs")
-            global _blacklisted_keys
-            _blacklisted_keys = {"moralis": {}, "helius": {}}
-    except Exception as e:
-        logger.warning("Failed to initialize blacklist cache: %s. Using in-memory only.", e)
-        _blacklisted_keys = {"moralis": {}, "helius": {}}
+# sets to hold bad keys (soft blacklist) to avoid repeatedly trying known-401 keys
+_bad_moralis_keys = set()
+_bad_helius_keys = set()
 
 # --------------------
 # Helpers
@@ -272,102 +130,39 @@ def _mask_key(s: str, keep: int = 6) -> str:
     return "..." + s[-keep:]
 
 def _valid_moralis_keys() -> List[str]:
-    """Return Moralis keys excluding currently blacklisted ones."""
-    _clean_expired_blacklisted_keys()  # Clean expired keys first
-    return [k for k in MORALIS_KEYS if not _is_blacklisted("moralis", k)]
+    """Return Moralis keys excluding soft-blacklisted ones."""
+    return [k for k in MORALIS_KEYS if k not in _bad_moralis_keys]
 
 def _valid_helius_keys() -> List[str]:
-    """Return Helius keys excluding currently blacklisted ones."""
-    _clean_expired_blacklisted_keys()  # Clean expired keys first
-    return [k for k in HELIUS_KEYS if not _is_blacklisted("helius", k)]
+    """Return Helius keys excluding soft-blacklisted ones."""
+    return [k for k in HELIUS_KEYS if k not in _bad_helius_keys]
 
 def _next_moralis_key_round_robin() -> str:
-    """Pick next Moralis key from non-blacklisted keys using round-robin."""
+    """Pick next Moralis key from non-blacklisted keys using a round-robin counter."""
     global _moralis_idx
     valid = _valid_moralis_keys()
     if not valid:
-        logger.error("No valid Moralis keys available (all blacklisted or expired)")
-        raise RuntimeError("No valid Moralis keys available")
-    
+        # If nothing valid, consider all keys (reset blacklist) to allow retries
+        logger.error("All Moralis keys are currently blacklisted (removed due to 401). Raise error.")
+        raise RuntimeError("No valid Moralis keys available (all keys returned 401).")
     key = valid[_moralis_idx % len(valid)]
+    used_idx = _moralis_idx
     _moralis_idx += 1
-    logger.debug("[moralis] using key: %s", _mask_key(key))
+    logger.debug("[moralis] using key idx_round=%d masked=%s", used_idx, _mask_key(key))
     return key
 
 def _next_helius_key_round_robin() -> str:
-    """Pick next Helius key from non-blacklisted keys using round-robin."""
+    """Pick next Helius key from non-blacklisted keys using a round-robin counter."""
     global _helius_idx
     valid = _valid_helius_keys()
     if not valid:
-        logger.error("No valid Helius keys available (all blacklisted or expired)")
-        raise RuntimeError("No valid Helius keys available")
-    
+        logger.error("All Helius keys are currently blacklisted (removed due to 401). Raise error.")
+        raise RuntimeError("No valid Helius keys available (all keys returned 401).")
     key = valid[_helius_idx % len(valid)]
+    used_idx = _helius_idx
     _helius_idx += 1
-    logger.debug("[helius] using key: %s", _mask_key(key))
+    logger.debug("[helius] using key idx_round=%d masked=%s", used_idx, _mask_key(key))
     return key
-
-def get_blacklist_status() -> Dict:
-    """Get current blacklist status for monitoring/debugging."""
-    _clean_expired_blacklisted_keys()
-    current_time = time.time()
-    
-    status = {
-        "moralis": {
-            "total_keys": len(MORALIS_KEYS),
-            "blacklisted_keys": len(_blacklisted_keys["moralis"]),
-            "available_keys": len(_valid_moralis_keys()),
-            "blacklisted_details": []
-        },
-        "helius": {
-            "total_keys": len(HELIUS_KEYS),
-            "blacklisted_keys": len(_blacklisted_keys["helius"]),
-            "available_keys": len(_valid_helius_keys()),
-            "blacklisted_details": []
-        }
-    }
-    
-    # Add details about blacklisted keys
-    for key, blacklist_time in _blacklisted_keys["moralis"].items():
-        expires_at = datetime.fromtimestamp(blacklist_time + MORALIS_BLACKLIST_DURATION, timezone.utc)
-        status["moralis"]["blacklisted_details"].append({
-            "key_masked": _mask_key(key),
-            "blacklisted_at": datetime.fromtimestamp(blacklist_time, timezone.utc).isoformat(),
-            "expires_at": expires_at.isoformat(),
-            "time_remaining_hours": max(0, (blacklist_time + MORALIS_BLACKLIST_DURATION - current_time) / 3600)
-        })
-    
-    for key, blacklist_time in _blacklisted_keys["helius"].items():
-        expires_at = datetime.fromtimestamp(blacklist_time + HELIUS_BLACKLIST_DURATION, timezone.utc)
-        status["helius"]["blacklisted_details"].append({
-            "key_masked": _mask_key(key),
-            "blacklisted_at": datetime.fromtimestamp(blacklist_time, timezone.utc).isoformat(),
-            "expires_at": expires_at.isoformat(),
-            "time_remaining_hours": max(0, (blacklist_time + HELIUS_BLACKLIST_DURATION - current_time) / 3600)
-        })
-    
-    return status
-
-def print_blacklist_status():
-    """Print current blacklist status for debugging."""
-    status = get_blacklist_status()
-    print("\n=== API Key Blacklist Status ===")
-    
-    print(f"\nMoralis Keys:")
-    print(f"  Total: {status['moralis']['total_keys']}")
-    print(f"  Available: {status['moralis']['available_keys']}")
-    print(f"  Blacklisted: {status['moralis']['blacklisted_keys']}")
-    
-    for detail in status['moralis']['blacklisted_details']:
-        print(f"    - Key {detail['key_masked']}: {detail['time_remaining_hours']:.1f}h remaining")
-    
-    print(f"\nHelius Keys:")
-    print(f"  Total: {status['helius']['total_keys']}")
-    print(f"  Available: {status['helius']['available_keys']}")
-    print(f"  Blacklisted: {status['helius']['blacklisted_keys']}")
-    
-    for detail in status['helius']['blacklisted_details']:
-        print(f"    - Key {detail['key_masked']}: {detail['time_remaining_hours']:.1f}h remaining")
 
 # --------------------
 # Supabase helpers
@@ -385,31 +180,34 @@ def save_to_supabase(df: pd.DataFrame, tokens: List[str], params: Dict[str, Any]
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     folder = "recent_analyses"
+    os.makedirs(folder, exist_ok=True)
 
     base_name = f"analysis_{ts}"
-    pkl_file_name = f"{base_name}.pkl"
-    json_file_name = f"{base_name}.json"
+    pkl_file_local = os.path.join(folder, f"{base_name}.pkl")
+    json_file_local = os.path.join(folder, f"{base_name}.json")
 
-    # Create data in memory instead of local files
-    pkl_data = joblib.dump(df)
+    joblib.dump(df, pkl_file_local)
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "tokens": tokens,
         "params": params,
         "records": df.fillna(0).to_dict(orient="records")
     }
-    json_data = json.dump(payload, ensure_ascii=False, indent=2).encode('utf-8')
+    with open(json_file_local, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
 
-    logger.info("Created analysis data in memory: %s and %s", pkl_file_name, json_file_name)
+    logger.info("Saved analysis locally: %s and %s", pkl_file_local, json_file_local)
 
-    # Upload directly to Supabase without local files
-    for data_bytes, filename in [(pkl_data, pkl_file_name), (json_data, json_file_name)]:
+    for local_path in [pkl_file_local, json_file_local]:
+        filename = os.path.basename(local_path)
         object_path = _supabase_path(folder, filename)
         try:
             supabase.storage.from_(BUCKET_NAME).remove([object_path])
         except Exception:
             pass
-        supabase.storage.from_(BUCKET_NAME).upload(object_path, data_bytes)
+        with open(local_path, "rb") as fh:
+            data_bytes = fh.read()
+            supabase.storage.from_(BUCKET_NAME).upload(object_path, data_bytes)
         logger.info("Uploaded to Supabase: %s", object_path)
 
 def list_recent_analyses(limit: int = 100, folder: str = "recent_analyses") -> List[Dict[str, Any]]:
@@ -445,10 +243,16 @@ def list_recent_analyses(limit: int = 100, folder: str = "recent_analyses") -> L
 def requests_with_failover(url: str, method: str = "GET", params: dict = None, headers: dict = None,
                            json_payload: dict = None, max_attempts: int = None, provider: str = "moralis", timeout: int = 20):
     """
-    Enhanced synchronous requests wrapper with time-based blacklist management.
+    Synchronous requests wrapper that rotates keys on 401/429 responses or connection errors.
+    - provider: "moralis" supported for sync usage
+    Behavior:
+     - rotate across keys that are not soft-blacklisted
+     - if a key returns 401, mark it as bad and skip it in the future
+     - on 429 (rate limit) treat as transient and continue rotating
     """
     attempt = 0
     last_exception = None
+    # default attempts: at least 6 or twice number of keys available
     if max_attempts is None:
         max_attempts = max(6, (len(MORALIS_KEYS) if MORALIS_KEYS else 1) * 2)
 
@@ -456,43 +260,52 @@ def requests_with_failover(url: str, method: str = "GET", params: dict = None, h
         attempt += 1
         try:
             if provider == "moralis":
-                key = _next_moralis_key_round_robin()
+                # pick next valid moralis key
+                try:
+                    key = _next_moralis_key_round_robin()
+                except RuntimeError as e:
+                    # no valid keys left
+                    raise
                 use_headers = dict(headers or {})
                 use_headers["Accept"] = "application/json"
                 use_headers["X-API-Key"] = key
+                resp = requests.request(method, url, params=params, headers=use_headers, json=json_payload, timeout=timeout)
             else:
                 use_headers = dict(headers or {})
-                key = None  # For non-moralis providers
-            
-            resp = requests.request(method, url, params=params, headers=use_headers, 
-                                  json=json_payload, timeout=timeout)
-            
-            if resp.status_code == 401 and provider == "moralis":
-                _add_to_blacklist("moralis", key)
-                logger.warning("[moralis] 401 response, key blacklisted for 24 hours")
+                resp = requests.request(method, url, params=params, headers=use_headers, json=json_payload, timeout=timeout)
+
+            # handle status codes
+            if resp.status_code == 401:
+                # mark this key as bad (soft blacklist) to avoid trying it repeatedly
+                if provider == "moralis":
+                    _bad_moralis_keys.add(key)
+                    logger.warning("[moralis] key masked=%s returned 401; blacklisting this key index.", _mask_key(key))
+                logger.warning("[%s] request returned 401 (attempt %d). Rotating key and retrying...", provider, attempt)
+                time.sleep(min(1 + attempt * 0.5, 5.0))
                 continue
-                
+
             if resp.status_code == 429:
-                logger.warning("[%s] 429 rate limit (attempt %d), rotating...", provider, attempt)
+                logger.warning("[%s] request returned 429 (rate limited) (attempt %d). Rotating key and retrying...", provider, attempt)
                 time.sleep(min(0.8 + attempt * 0.5, 5.0))
                 continue
-                
+
             resp.raise_for_status()
             try:
                 return resp.json()
             except Exception:
                 return {"_raw_text": resp.text}
-            
         except requests.RequestException as e:
             last_exception = e
-            logger.warning("[%s] exception (attempt %d): %s", provider, attempt, e)
+            logger.warning("[%s] request exception (attempt %d): %s", provider, attempt, e)
             time.sleep(min(0.5 * attempt, 5.0))
-    
+            continue
+
     raise RuntimeError(f"All attempts failed for {provider}. Last exception: {last_exception}")
 
 async def aiohttp_with_failover_post(payload: dict, max_attempts: int = None, timeout: int = 30) -> dict:
     """
-    Enhanced async wrapper with time-based blacklist management.
+    Async wrapper to POST to Helius RPC, rotating through HELIUS_KEYS on 429/401 & retrying.
+    Returns parsed json.
     """
     attempt = 0
     last_exc = None
@@ -505,7 +318,6 @@ async def aiohttp_with_failover_post(payload: dict, max_attempts: int = None, ti
             key = _next_helius_key_round_robin()
         except RuntimeError:
             raise
-            
         helius_url = f"https://mainnet.helius-rpc.com/?api-key={key}"
         try:
             start = time.time()
@@ -515,23 +327,22 @@ async def aiohttp_with_failover_post(payload: dict, max_attempts: int = None, ti
                     if elapsed > LONG_CALL_THRESHOLD:
                         logger.warning("Long Helius RPC call method=%s elapsed=%.2fs", payload.get("method"), elapsed)
                     if resp.status == 401:
-                        _add_to_blacklist("helius", key)
-                        logger.warning("[helius] 401 response, key blacklisted for 14 days")
+                        # blacklist this key
+                        _bad_helius_keys.add(key)
+                        logger.warning("[helius] key masked=%s returned 401; blacklisting this key index.", _mask_key(key))
                         await asyncio.sleep(min(0.5 * attempt, 5.0))
                         continue
-                        
                     if resp.status == 429:
-                        logger.warning("[helius] 429 rate limit (attempt %d), rotating...", attempt)
+                        logger.warning("[helius] returned 429 (rate limited) on attempt %d, rotating key...", attempt)
                         await asyncio.sleep(min(0.5 * attempt, 5.0))
                         continue
-                        
                     resp.raise_for_status()
                     return await resp.json()
-                    
         except Exception as e:
             last_exc = e
-            logger.warning("[helius] exception (attempt %d): %s", attempt, e)
+            logger.warning("[helius] exception on attempt %d: %s", attempt, e)
             await asyncio.sleep(min(0.5 * attempt, 5.0))
+            continue
 
     raise RuntimeError(f"All helius attempts failed. Last exception: {last_exc}")
 
@@ -847,18 +658,20 @@ def attach_minute_price(df_in: pd.DataFrame, minute_price_df: pd.DataFrame, mint
     return merged.drop(columns=["minute"])
 
 # --------------------
-# Dexscreener caching (using in-memory cache only)
+# Dexscreener caching
 # --------------------
-_price_cache = {}
-
 def load_price_cache():
-    """Load price cache from memory (no disk access)."""
-    return _price_cache.copy()
+    try:
+        cache = joblib.load(CACHE_FILE)
+        return cache if isinstance(cache, dict) else {}
+    except Exception:
+        return {}
 
 def save_price_cache(cache: dict):
-    """Save price cache to memory (no disk access)."""
-    global _price_cache
-    _price_cache = cache.copy()
+    try:
+        joblib.dump(cache, CACHE_FILE)
+    except Exception as e:
+        logger.warning("Failed to save cache: %s", e)
 
 async def dexscreener_fetch_price(mint: str, session: aiohttp.ClientSession) -> Optional[float]:
     url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
@@ -990,6 +803,7 @@ def run_pipeline(tokens: List[str],
         # Filter to only requested tokens
         trades_df = trades_df[trades_df['mint_address'].isin(tokens)]
         logger.info(f"[Pipeline] After filtering: {len(trades_df)} trades remaining")
+
 
     minute_price_df = build_minute_prices_from_trades(trades_df)
 
@@ -1191,7 +1005,7 @@ def run_pipeline(tokens: List[str],
         if c not in final_summary.columns:
             final_summary[c] = 0.0
 
-    logger.info("--- Final Early Trader Profitability Report (top 50) ---")
+    logger.info("--- 🏆 Final Early Trader Profitability Report (top 50) ---")
     if final_summary.empty:
         logger.info("Final summary empty after filtering.")
     else:
@@ -1208,6 +1022,7 @@ def run_pipeline(tokens: List[str],
         logger.warning("Failed to save/upload to Supabase: %s", e)
 
     return final_summary
+
 # --------------------
 # CLI
 # --------------------
